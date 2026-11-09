@@ -1,212 +1,386 @@
-"""Tests for the JSONL I/O utilities, including tree loading."""
+"""Tests for the `data_models` module."""
 
-from __future__ import annotations
-
-import json
-import typing as t
+import inspect
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
+from click import ParamType
 
-from leaderboards.jsonl_io import (
-    load_records_from_jsonl_files,
-    load_records_from_result_tree,
-)
+from euroeval import __version__
+from euroeval.benchmarker import Benchmarker
+from euroeval.data_models import BenchmarkConfig, BenchmarkConfigParams, BenchmarkResult
+from euroeval.metrics import HuggingFaceMetric, Metric
 
 
-class TestLoadRecordsFromJsonlFiles:
-    """Tests for load_records_from_jsonl_files (unchanged API)."""
+class TestBenchmarkParametersAreConsistent:
+    """Test that the same benchmark parameters are used everywhere."""
 
-    def test_loads_jsonl_records(self, tmp_path: Path) -> None:
-        """Should load records from JSONL files.
+    def test_config_params_is_the_same_as_benchmark_config(self) -> None:
+        """Test that `BenchmarkConfigParams` agrees with `BenchmarkConfig`."""
+        benchmark_config_params = set(
+            inspect.signature(BenchmarkConfigParams).parameters.keys()
+        ) - {"dataset", "task", "language", "custom_datasets_file"}
+        benchmark_config_fields = set(
+            inspect.signature(BenchmarkConfig).parameters.keys()
+        ) - {"datasets", "tasks", "languages"}
+        assert benchmark_config_params == benchmark_config_fields
+
+    def test_config_params_is_the_same_as_benchmark_method(self) -> None:
+        """Test that `BenchmarkConfigParams` agrees with `Benchmarker.benchmark`."""
+        benchmark_config_params = set(
+            inspect.signature(BenchmarkConfigParams).parameters.keys()
+        ) - {"run_with_cli"}
+        benchmark_method_params = set(
+            inspect.signature(Benchmarker.benchmark).parameters.keys()
+        ) - {"self", "model", "batch_size", "dataset_language", "model_language"}
+        assert benchmark_config_params == benchmark_method_params
+
+    def test_config_params_is_the_same_as_benchmarker_init(self) -> None:
+        """Test that `BenchmarkConfigParams` agrees with `Benchmarker.__init__`."""
+        benchmark_config_params = set(
+            inspect.signature(BenchmarkConfigParams).parameters.keys()
+        )
+        benchmarker_init_params = set(
+            inspect.signature(Benchmarker.__init__).parameters.keys()
+        ) - {"self", "batch_size", "dataset_language", "model_language"}
+        assert benchmark_config_params == benchmarker_init_params
+
+    def test_config_params_is_the_same_as_cli(
+        self, cli_params: dict[str, ParamType]
+    ) -> None:
+        """Test that `BenchmarkConfigParams` agrees with the CLI.
 
         Args:
-            tmp_path:
-                Temporary directory for files created by the test.
+            cli_params:
+                Cli params supplied to the test.
         """
-        jsonl_file = tmp_path / "model.jsonl"
-        jsonl_file.write_text(
-            '{"model_info": {"id": "model_a"}, "scores": {"acc": 0.5}}\n'
-            '{"model_info": {"id": "model_b"}, "scores": {"acc": 0.6}}\n'
+        benchmark_config_params = set(
+            inspect.signature(BenchmarkConfigParams).parameters.keys()
+        ) - {"run_with_cli"}
+        cli_benchmark_params = set(cli_params.keys()) - {
+            "model",
+            "batch_size",
+            "dataset_language",
+            "model_language",
+            "help",
+        }
+        assert benchmark_config_params == cli_benchmark_params
+
+
+class TestBenchmarkResult:
+    """Tests related to the `BenchmarkResult` class."""
+
+    @pytest.fixture(scope="class")
+    def benchmark_result(self) -> Generator[BenchmarkResult, None, None]:
+        """Fixture for a `BenchmarkResult` object.
+
+        Yields:
+            A `BenchmarkResult` object.
+        """
+        yield BenchmarkResult(
+            dataset="dataset",
+            model="model",
+            generative=False,
+            generative_type=None,
+            few_shot=True,
+            validation_split=False,
+            num_model_parameters=100,
+            max_sequence_length=100,
+            vocabulary_size=100,
+            merge=False,
+            languages=["da"],
+            task="task",
+            results=dict(),
         )
 
-        records = load_records_from_jsonl_files(paths=[jsonl_file])
+    @pytest.fixture(scope="class")
+    def results_path(self) -> Generator[Path, None, None]:
+        """Fixture for a `Path` object to a results file.
 
-        assert len(records) == 2
-        assert records[0]["model_info"]["id"] == "model_a"  # ty: ignore[not-subscriptable]
-        assert records[1]["model_info"]["id"] == "model_b"  # ty: ignore[not-subscriptable]
+        Yields:
+            A `Path` object to a results file.
+        """
+        results_path = Path(".euroeval_cache/test_results.jsonl")
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        yield results_path
+
+    def test_benchmark_result_parameters(
+        self, benchmark_result: BenchmarkResult
+    ) -> None:
+        """Test that the `BenchmarkResult` parameters are correct.
+
+        Args:
+            benchmark_result:
+                Benchmark result supplied to the test.
+        """
+        assert benchmark_result.dataset == "dataset"
+        assert benchmark_result.model == "model"
+        assert benchmark_result.generative is False
+        assert benchmark_result.generative_type is None
+        assert benchmark_result.few_shot is True
+        assert benchmark_result.validation_split is False
+        assert benchmark_result.num_model_parameters == 100
+        assert benchmark_result.max_sequence_length == 100
+        assert benchmark_result.vocabulary_size == 100
+        assert benchmark_result.merge is False
+        assert benchmark_result.languages == ["da"]
+        assert benchmark_result.task == "task"
+        assert benchmark_result.results == dict()
+        assert benchmark_result.euroeval_version == __version__
 
     @pytest.mark.parametrize(
-        "text", ["left}{right", "x\u0085y", "x\u2028y", "x\u2029y"]
+        argnames=["config", "expected"],
+        argvalues=[
+            (
+                dict(
+                    dataset="dataset",
+                    model="model",
+                    few_shot=True,
+                    validation_split=False,
+                    num_model_parameters=100,
+                    max_sequence_length=100,
+                    vocabulary_size=100,
+                    languages=["da"],
+                    task="task",
+                    results=dict(),
+                ),
+                BenchmarkResult(
+                    dataset="dataset",
+                    model="model",
+                    merge=False,
+                    generative=False,
+                    generative_type=None,
+                    few_shot=True,
+                    validation_split=False,
+                    num_model_parameters=100,
+                    max_sequence_length=100,
+                    vocabulary_size=100,
+                    languages=["da"],
+                    task="task",
+                    results=dict(),
+                    use_bits_per_character=False,
+                ),
+            ),
+            (
+                dict(
+                    dataset="dataset",
+                    model="model (few-shot)",
+                    validation_split=False,
+                    num_model_parameters=100,
+                    max_sequence_length=100,
+                    vocabulary_size=100,
+                    languages=["da"],
+                    task="task",
+                    results=dict(),
+                ),
+                BenchmarkResult(
+                    dataset="dataset",
+                    model="model",
+                    merge=False,
+                    generative=True,
+                    generative_type=None,
+                    few_shot=True,
+                    validation_split=False,
+                    num_model_parameters=100,
+                    max_sequence_length=100,
+                    vocabulary_size=100,
+                    languages=["da"],
+                    task="task",
+                    results=dict(),
+                    use_bits_per_character=False,
+                ),
+            ),
+            (
+                dict(
+                    dataset="dataset",
+                    model="model (val)",
+                    few_shot=True,
+                    num_model_parameters=100,
+                    max_sequence_length=100,
+                    vocabulary_size=100,
+                    languages=["da"],
+                    task="task",
+                    results=dict(),
+                ),
+                BenchmarkResult(
+                    dataset="dataset",
+                    model="model",
+                    merge=False,
+                    generative=False,
+                    generative_type=None,
+                    few_shot=True,
+                    validation_split=True,
+                    num_model_parameters=100,
+                    max_sequence_length=100,
+                    vocabulary_size=100,
+                    languages=["da"],
+                    task="task",
+                    results=dict(),
+                    use_bits_per_character=False,
+                ),
+            ),
+            (
+                dict(
+                    dataset="dataset",
+                    model="model (few-shot, val)",
+                    num_model_parameters=100,
+                    max_sequence_length=100,
+                    vocabulary_size=100,
+                    languages=["da"],
+                    task="task",
+                    results=dict(),
+                ),
+                BenchmarkResult(
+                    dataset="dataset",
+                    model="model",
+                    merge=False,
+                    generative=True,
+                    generative_type=None,
+                    few_shot=True,
+                    validation_split=True,
+                    num_model_parameters=100,
+                    max_sequence_length=100,
+                    vocabulary_size=100,
+                    languages=["da"],
+                    task="task",
+                    results=dict(),
+                    use_bits_per_character=False,
+                ),
+            ),
+        ],
+        ids=[
+            "normal case",
+            "few-shot model name",
+            "validation split model name",
+            "few-shot and validation split model name",
+        ],
     )
-    def test_preserves_json_string_content(self, tmp_path: Path, text: str) -> None:
-        """Do not split Unicode string content before shared parsing.
+    def test_from_dict(self, config: dict, expected: BenchmarkResult) -> None:
+        """Test that `BenchmarkResult.from_dict` works as expected.
 
         Args:
-            tmp_path:
-                Temporary directory for the JSONL file.
-            text:
-                A valid JSON string containing a non-boundary separator.
+            config:
+                Config supplied to the test.
+            expected:
+                Expected value for this test case.
         """
-        records = [{"model_info": {"id": "synthetic"}, "text": text}, {"last": True}]
-        path = tmp_path / "records.jsonl"
-        path.write_text(
-            "\r\n".join(json.dumps(record, ensure_ascii=False) for record in records)
-            + "\r\n",
-            encoding="utf-8",
+        assert BenchmarkResult.from_dict(config) == expected
+
+    @pytest.mark.parametrize(
+        "model", ["synthetic}{model", "x\u0085y", "x\u2028y", "x\u2029y"]
+    )
+    def test_jsonl_writer_reader_preserves_model_name(
+        self, benchmark_result: BenchmarkResult, tmp_path: Path, model: str
+    ) -> None:
+        """Round-trip valid quoted content through the real JSONL writer and reader.
+
+        Args:
+            benchmark_result:
+                A synthetic benchmark result without model execution.
+            tmp_path:
+                Temporary directory for the result file.
+            model:
+                Model name whose quoted content is not a record boundary.
+        """
+        original = benchmark_result.model_copy(
+            update={"model": model, "results": {"raw": [], "total": {}}}
         )
+        path = tmp_path / "results.jsonl"
+        original.append_to_results(results_path=path)
 
-        assert load_records_from_jsonl_files(paths=[path]) == records
+        restored = BenchmarkResult.from_jsonl(results_path=path)
 
+        assert len(restored) == 1
+        assert restored[0].model == model
+        assert restored[0].dataset == original.dataset
+        assert restored[0].results == original.results
 
-class TestLoadRecordsFromResultTree:
-    """Tests for load_records_from_result_tree."""
-
-    def test_empty_directory_returns_empty_list(self, tmp_path: Path) -> None:
-        """Should return empty list for directory with no JSON files.
-
-        Args:
-            tmp_path:
-                Temporary directory for files created by the test.
-        """
-        (tmp_path / "empty_model").mkdir()
-
-        records = load_records_from_result_tree(results_dir=tmp_path)
-
-        assert records == []
-
-    def test_loads_multiple_datasets_per_model(self, tmp_path: Path) -> None:
-        """Should load multiple dataset files per model.
-
-        Args:
-            tmp_path:
-                Temporary directory for files created by the test.
-        """
-        model_dir = tmp_path / "test_model"
-        model_dir.mkdir()
-
-        record1 = {"model_info": {"id": "test"}, "scores": {"acc": 0.5}}
-        record2 = {"model_info": {"id": "test"}, "scores": {"acc": 0.6}}
-
-        (model_dir / "dataset1__test__zeroshot.json").write_text(json.dumps(record1))
-        (model_dir / "dataset2__val__fewshot.json").write_text(json.dumps(record2))
-
-        records = load_records_from_result_tree(results_dir=tmp_path)
-
-        assert len(records) == 2
-
-    def test_loads_multiple_models(self, tmp_path: Path) -> None:
-        """Should load records from multiple model subdirectories.
+    @pytest.mark.parametrize(
+        ("release_date", "expected"),
+        [("2024-02-03", "2024-02-03"), ("not-a-date", None), (None, None)],
+    )
+    def test_release_date_normalisation(
+        self,
+        benchmark_result: BenchmarkResult,
+        release_date: str | None,
+        expected: str | None,
+    ) -> None:
+        """Missing and malformed release dates remain backwards compatible.
 
         Args:
-            tmp_path:
-                Temporary directory for files created by the test.
+            benchmark_result:
+                Benchmark result supplied to the test.
+            release_date:
+                Release date supplied to the test.
+            expected:
+                Expected value for this test case.
         """
-        model_a_dir = tmp_path / "model_a"
-        model_b_dir = tmp_path / "model_b"
-        model_a_dir.mkdir()
-        model_b_dir.mkdir()
+        result = benchmark_result.model_copy(update={"release_date": release_date})
+        result = BenchmarkResult.model_validate(result.model_dump())
+        assert result.release_date == expected
 
-        record_a = {"model_info": {"id": "model_a"}, "scores": {"acc": 0.6}}
-        record_b = {"model_info": {"id": "model_b"}, "scores": {"acc": 0.7}}
 
-        (model_a_dir / "ds__test__zeroshot.json").write_text(json.dumps(record_a))
-        (model_b_dir / "ds__test__zeroshot.json").write_text(json.dumps(record_b))
+class TestMetric:
+    """Tests for the `Metric` class."""
 
-        records = load_records_from_result_tree(results_dir=tmp_path)
-
-        assert len(records) == 2
-        model_ids = {t.cast(dict[str, object], r["model_info"])["id"] for r in records}
-        assert model_ids == {"model_a", "model_b"}
-
-    def test_loads_single_record_per_file(self, tmp_path: Path) -> None:
-        """Should load one record per JSON file in the tree structure.
+    def test_attributes_correspond_to_arguments(
+        self, metric: HuggingFaceMetric
+    ) -> None:
+        """Test that the metric config attributes correspond to the arguments.
 
         Args:
-            tmp_path:
-                Temporary directory for files created by the test.
+            metric:
+                Metric supplied to the test.
         """
-        model_dir = tmp_path / "test_model"
-        model_dir.mkdir()
+        assert (
+            metric.name,
+            metric.pretty_name,
+            metric.huggingface_id,
+            metric.results_key,
+        ) == ("metric_name", "Metric name", "metric_id", "metric_key")
 
-        record = {"model_info": {"id": "test_model"}, "scores": {"acc": 0.5}}
-        json_file = model_dir / "dataset__test__zeroshot.json"
-        json_file.write_text(json.dumps(record))
-
-        records = load_records_from_result_tree(results_dir=tmp_path)
-
-        assert len(records) == 1
-        # Type ignore needed because ty infers dict[str, object]
-        assert records[0]["model_info"]["id"] == "test_model"  # ty: ignore[not-subscriptable]
-        assert records[0]["scores"]["acc"] == 0.5  # ty: ignore[not-subscriptable]
-
-    def test_preserves_metadata_fields(self, tmp_path: Path) -> None:
-        """Should preserve all metadata fields in model_info.
+    def test_default_value_of_compute_kwargs(self, metric: HuggingFaceMetric) -> None:
+        """Test that the default value of `compute_kwargs` is an empty dictionary.
 
         Args:
-            tmp_path:
-                Temporary directory for files created by the test.
+            metric:
+                Metric supplied to the test.
         """
-        model_dir = tmp_path / "test_model"
-        model_dir.mkdir()
+        assert metric.compute_kwargs == dict()
 
-        record = {
-            "model_info": {
-                "id": "test/model",
-                "name": "Test Model",
-                "additional_details": {
-                    "commercially_licensed": True,
-                    "open": True,
-                    "trained_from_scratch": False,
-                    "model_url": "https://example.com/model",
-                },
-            },
-            "scores": {"acc": 0.5},
-        }
-
-        json_file = model_dir / "dataset__test__zeroshot.json"
-        json_file.write_text(json.dumps(record))
-
-        records = load_records_from_result_tree(results_dir=tmp_path)
-
-        assert len(records) == 1
-        loaded = records[0]
-        assert loaded["model_info"]["id"] == "test/model"  # ty: ignore[not-subscriptable]
-        assert loaded["model_info"]["name"] == "Test Model"  # ty: ignore[not-subscriptable]
-        details = loaded["model_info"]["additional_details"]  # ty: ignore[not-subscriptable]
-        assert details["commercially_licensed"] is True
-        assert details["open"] is True
-        assert details["trained_from_scratch"] is False
-        assert details["model_url"] == "https://example.com/model"
-
-    def test_raises_on_malformed_json(self, tmp_path: Path) -> None:
-        """Should raise JSONDecodeError on malformed JSON files.
+    @pytest.mark.parametrize(
+        "inputs,expected",
+        [
+            (0.5, (50.0, "50.00%")),
+            (0.123456, (12.3456, "12.35%")),
+            (0.0, (0.0, "0.00%")),
+            (1.0, (100.0, "100.00%")),
+            (0.999999, (99.9999, "100.00%")),
+            (2.0, (200.0, "200.00%")),
+            (-1.0, (-100.0, "-100.00%")),
+        ],
+    )
+    def test_default_value_of_postprocessing_fn(
+        self, metric: Metric, inputs: float, expected: tuple[float, str]
+    ) -> None:
+        """Test that the default value of `postprocessing_fn` is correct.
 
         Args:
-            tmp_path:
-                Temporary directory for files created by the test.
+            metric:
+                Metric supplied to the test.
+            inputs:
+                Inputs supplied to the test.
+            expected:
+                Expected value for this test case.
         """
-        model_dir = tmp_path / "bad_model"
-        model_dir.mkdir()
+        assert metric.postprocessing_fn(inputs) == expected
 
-        json_file = model_dir / "dataset__test__zeroshot.json"
-        json_file.write_text("{ invalid json }")
-
-        with pytest.raises(json.JSONDecodeError):
-            load_records_from_result_tree(results_dir=tmp_path)
-
-    def test_raises_on_non_dict_content(self, tmp_path: Path) -> None:
-        """Should raise ValueError if JSON file contains non-dict.
+    def test_metric_is_object(self, metric: HuggingFaceMetric) -> None:
+        """Test that the metric config is a `Metric` object.
 
         Args:
-            tmp_path:
-                Temporary directory for files created by the test.
+            metric:
+                Metric supplied to the test.
         """
-        model_dir = tmp_path / "bad_model"
-        model_dir.mkdir()
-
-        json_file = model_dir / "dataset__test__zeroshot.json"
-        json_file.write_text("[1, 2, 3]")
-
-        with pytest.raises(ValueError, match="Expected dict"):
-            load_records_from_result_tree(results_dir=tmp_path)
+        assert isinstance(metric, Metric)
