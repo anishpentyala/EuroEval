@@ -1,1376 +1,384 @@
-"""Data models used in EuroEval."""
+"""Parsers for issue bodies, euroeval output, and JSONL result files.
 
-import collections.abc as c
-import importlib.metadata
+Pure-function helpers extracted from ``process_evaluation_queue.py`` so
+they're easy to reuse and to test in isolation. Everything in here is
+side-effect-free except :func:`read_jsonl_lines`, which reads from disk.
+"""
+
+from __future__ import annotations
+
 import json
-import logging
 import re
-import typing as t
-from copy import deepcopy
-from dataclasses import dataclass, field
 from pathlib import Path
 
-import pydantic
-import torch
-from datasets import DatasetDict
-from transformers.generation.configuration_utils import GenerationConfig
+from euroeval.data_models import BenchmarkResult
 
 from .constants import (
-    ATTENTION_BACKENDS,
-    CHOICES_MAPPING,
-    MAX_NUMBER_OF_LOGGING_LANGUAGES,
+    ERRORED_BENCHMARKS_RE,
+    ISSUE_TITLE_PREFIX,
+    MODEL_ID_BODY_RE,
+    SKIPPED_BENCHMARKS_RE,
 )
-from .date_utils import normalise_release_date
-from .eee_utils import benchmark_result_from_eee_dict, benchmark_result_to_eee_dict
-from .enums import Device, GenerativeType, ModelType, ShotMode, TaskGroup
-from .exceptions import InvalidBenchmark
-from .jsonl_io import parse_jsonl_lines
-from .languages import (
-    ENGLISH,
-    EUROPEAN_PORTUGUESE,
-    NORWEGIAN,
-    NORWEGIAN_BOKMÅL,
-    NORWEGIAN_NYNORSK,
-    PORTUGUESE,
-    Language,
+from .evaluation_common import missing_official_dataset_language_pairs
+
+# Strips ANSI colour/style escape codes that euroeval emits when logging. Matches
+# both the real escape byte (``\x1b[..m``, as captured live from the pty) and the
+# caret-notation form (``^[[..m``) that some log/transport layers substitute.
+_ANSI_ESCAPE_RE = re.compile(r"(?:\x1b|\^\[)\[[0-9;]*m")
+
+# Lines that ``FULL_LOG=1`` floods the output with and which bury the real
+# error: serialised result records and transformers training-progress dicts.
+_NOISE_SUBSTRINGS = (
+    '"schema_version"',
+    '"evaluation_id"',
+    '"raw_results"',
+    '"evaluation_results"',
+    "samples_per_second",
+    "steps_per_second",
 )
-from .logging_utils import log_once
-from .metrics.base import Metric
-from .preprocessing import build_preprocessing_func
-from .types import FailedInstance, ScoreDict
+_TRAINING_PROGRESS_RE = re.compile(
+    r"^\{'(loss|eval_loss|train_runtime|train_loss)'|^\{\"(loss|eval_loss)\""
+)
 
-if t.TYPE_CHECKING:
-    from .enums import InferenceBackend
+# Markers of the actually-useful error text, in priority order of specificity.
+_LOAD_ERROR_RE = re.compile(
+    r"could not be loaded|Unrecognized configuration class|is a gated repository|"
+    r"PYTORCH_ENABLE_MPS_FALLBACK|does not support the .* task",
+    re.IGNORECASE,
+)
+_TRACEBACK_START = "Traceback (most recent call last):"
+_EXCEPTION_LINE_RE = re.compile(r"^[\w.]*(Error|Exception|Timeout|Interrupt)\b.*")
+_SUMMARY_LINE_RE = re.compile(r"errored\s+\d+\s+benchmarks?", re.IGNORECASE)
+
+# vLLM's ``WorkerProc`` runs in a subprocess that logs to stderr with a
+# ``(Worker_TP* pid=*)`` prefix. When initialisation fails the main process only
+# re-raises a generic ``WorkerProc initialization failed`` exception, while the
+# real cause is in the worker-prefixed ``ERROR`` lines that precede it.
+_WORKER_PREFIX_RE = re.compile(r"^\(Worker_TP\d+\s+pid=\d+\)")
+_WORKER_ERROR_RE = re.compile(r"^\(Worker_TP\d+\s+pid=\d+\)\s+ERROR\b", re.IGNORECASE)
+_WORKERPROC_FAILED_RE = re.compile(r"WorkerProc initialization failed", re.IGNORECASE)
+
+# Individual lines longer than this are truncated so a single giant JSON/param
+# dump line can't swamp the summary; the informative head is kept.
+_MAX_LINE_CHARS = 600
 
 
-def _convert_old_raw_results_format(config: dict[str, object]) -> None:
-    """Convert old raw_results format in-place.
-
-    Handles legacy nested dict format:
-    - raw = {"test": [{"mcc": 0.5, "accuracy": 0.6}]}
-    and converts to flat list: raw = [{"test_mcc": 0.5, "test_accuracy": 0.6}].
-
-    List format raw = [{"mcc": 0.5, "accuracy": 0.6}] is preserved as-is for EEE format.
+def completed_languages(lines: list[str], requested_languages: list[str]) -> list[str]:
+    """Return requested languages whose official pair coverage is complete.
 
     Args:
-        config:
-            The result mapping to convert in place.
-    """
-    if "results" not in config:
-        return
-    results = t.cast(dict[str, object], config["results"])
-    if "raw" not in results:
-        return
-    raw = results["raw"]
-
-    # Preserve list format - it's what EEE format needs
-    if isinstance(raw, list):
-        return
-
-    # Convert nested dict format: {"test": [...]} to flat list [{...}]
-    if isinstance(raw, dict):
-        raw_list: list[dict[str, float]] = []
-        for split_name, split_data in raw.items():
-            if not isinstance(split_data, list) or not split_data:
-                continue
-            for i, item in enumerate(split_data):
-                if not isinstance(item, dict):
-                    continue
-                while len(raw_list) <= i:
-                    raw_list.append({})
-                for metric, value in item.items():
-                    if isinstance(value, (int, float)):
-                        key = f"{split_name}_{metric}"
-                        if key not in raw_list[i]:
-                            raw_list[i][key] = float(value)
-        if raw_list:
-            results["raw"] = raw_list
-
-
-def get_package_version(package_name: str) -> str | None:
-    """Get the version of a package.
-
-    Args:
-        package_name:
-            The name of the package.
+        lines:
+            The accumulated JSONL result lines.
+        requested_languages:
+            The flattened language codes selected on the issue.
 
     Returns:
-        The version of the package, or None if the package is not installed.
+        The subset of ``requested_languages`` for which no official
+        dataset/language pair is still missing.
     """
-    try:
-        return importlib.metadata.version(package_name)
-    except importlib.metadata.PackageNotFoundError:
+    missing = missing_official_dataset_language_pairs(
+        lines=lines, requested_languages=requested_languages
+    )
+    incomplete = {lang for _, lang in missing}
+    return [lang for lang in requested_languages if lang not in incomplete]
+
+
+def extract_model_id(title: str, body: str | None = None) -> str | None:
+    """Return the model id for an issue, preferring the body's Model ID section.
+
+    Mirrors the frontend's ``extractModelId`` so the queue processor reads
+    the same source of truth as the UI: the issue body's ``### Model ID``
+    section, falling back to the title prefix for legacy issues that lack
+    the section.
+
+    Args:
+        title:
+            The full GitHub issue title.
+        body (optional):
+            The markdown body of the issue, or None. Defaults to None.
+
+    Returns:
+        The parsed model id, or None if neither the body nor the title
+        yield a usable value.
+    """
+    if body:
+        m = MODEL_ID_BODY_RE.search(body)
+        if m:
+            candidate = m.group(1).strip().strip("`*_").strip()
+            if candidate and candidate != "<model-name>":
+                return candidate
+    prefix = f"{ISSUE_TITLE_PREFIX} "
+    if not title.startswith(prefix):
         return None
+    rest = title[len(prefix) :].strip()
+    return rest if rest and rest != "<model-name>" else None
 
 
-class BenchmarkResult(pydantic.BaseModel):
-    """A benchmark result."""
+def format_dataset_language_pairs(dataset_language_pairs: set[tuple[str, str]]) -> str:
+    """Return a compact stable string representation of dataset/language pairs.
 
-    dataset: str
-    task: str
-    languages: c.Sequence[str]
-    model: str
-    results: ScoreDict
-    num_model_parameters: int
-    max_sequence_length: int
-    vocabulary_size: int
-    merge: bool
-    generative: bool
-    generative_type: str | None
-    few_shot: bool | None
-    validation_split: bool | None
-    use_bits_per_character: bool | None = None
-    euroeval_version: str | None = get_package_version("euroeval")
-    transformers_version: str | None = get_package_version("transformers")
-    torch_version: str | None = get_package_version("torch")
-    vllm_version: str | None = get_package_version("vllm")
-    xgrammar_version: str | None = get_package_version("xgrammar")
-    litellm_version: str | None = None
-    laya_version: str | None = None
-    model_type: str | None = None
-    inference_engine: str | None = None
-    # EuroEval-specific metadata fields (preserved through EEE conversion)
-    commercially_licensed: bool | None = None
-    open: bool | None = None
-    trained_from_scratch: bool | None = None
-    release_date: str | None = None
-    contamination_canary_evidence: dict[str, object] | None = None
+    Args:
+        dataset_language_pairs:
+            The set of ``(dataset_name, language_code)`` pairs to format.
 
-    @pydantic.field_validator("contamination_canary_evidence", mode="before")
-    @classmethod
-    def _validate_contamination_canary_evidence(
-        cls, value: object
-    ) -> dict[str, object] | None:
-        """Validate and canonicalise embedded contamination-canary evidence.
-
-        Args:
-            value:
-                The unvalidated evidence value.
-
-        Returns:
-            The canonical evidence mapping, or ``None`` when absent.
-        """
-        if value is None:
-            return None
-        from .canary_evidence import evidence_from_dict  # noqa: PLC0415
-
-        return evidence_from_dict(value).to_dict()
-
-    def append_to_results(self, results_path: Path) -> None:
-        """Append the benchmark result to the results file.
-
-        Each record is written self-terminated with a trailing newline. If the
-        file already exists without a trailing newline (e.g. written by an older
-        version), a separating newline is added first so records can't be glued
-        onto the same line.
-
-        Args:
-            results_path:
-                The path to the results file.
-        """
-        json_str = json.dumps(self.to_eee_dict(), ensure_ascii=False)
-        needs_sep = (
-            results_path.exists()
-            and results_path.stat().st_size > 0
-            and not results_path.read_bytes().endswith(b"\n")
-        )
-        with results_path.open("a") as f:
-            f.write(("\n" if needs_sep else "") + json_str + "\n")
-
-    def to_eee_dict(self) -> dict[str, object]:
-        """Convert this benchmark result to the Every Eval Ever (EEE) format.
-
-        Produces a dictionary conforming to the Every Eval Ever JSON schema v0.2.1
-        (https://github.com/evaleval/every_eval_ever/blob/main/eval.schema.json).
-        The resulting dict can be written directly to
-        `euroeval_benchmark_results.jsonl` and later reconstructed without loss
-        via `from_eee_dict` (or `from_dict`).
-
-        Returns:
-            A dictionary matching the EEE JSON schema v0.2.1.
-        """
-        return benchmark_result_to_eee_dict(result=self)
-
-    @classmethod
-    def from_jsonl(cls, results_path: Path) -> list["BenchmarkResult"]:
-        """Load benchmark results from a JSONL file.
-
-        Parses a JSONL file with robust handling of blank lines and concatenated
-        JSON objects (`}{`). Returns an empty list if the file does not exist.
-
-        Args:
-            results_path:
-                The path to the JSONL file containing benchmark results.
-
-        Returns:
-            A list of BenchmarkResult instances.
-        """
-        if not results_path.exists():
-            return []
-
-        lines = results_path.read_text(encoding="utf-8").split("\n")
-        records = parse_jsonl_lines(lines=lines, source=str(results_path), strict=False)
-        return [cls.from_dict(record) for record in records]
-
-    @classmethod
-    def from_dict(cls, config: dict[str, object]) -> "BenchmarkResult":
-        """Create a benchmark result from a dictionary.
-
-        Args:
-            config:
-                The configuration dictionary.
-
-        Returns:
-            The benchmark result.
-        """
-        # Detect Every Eval Ever format by the presence of schema_version
-        if "schema_version" in config:
-            return cls.from_eee_dict(config)
-
-        # To be backwards compatible, we accept old results which changed the model
-        # name with parameters rather than adding them as explicit parameters
-        val_matches = re.search(r"\(.*val.*\)$", config["model"])
-        few_shot_matches = re.search(r"\(.*few-shot.*\)$", config["model"])
-        zero_shot_matches = re.search(r"\(.*zero-shot.*\)$", config["model"])
-        config["model"] = re.sub(
-            r"\(.*(few-shot|val).*\)$", "", config["model"]
-        ).strip()
-
-        if "merge" not in config:
-            config["merge"] = False
-        if "generative" not in config:
-            config["generative"] = (
-                few_shot_matches is not None or zero_shot_matches is not None
-            )
-        if "generative_type" not in config:
-            config["generative_type"] = None
-        if "few_shot" not in config:
-            config["few_shot"] = zero_shot_matches is None
-        if "validation_split" not in config:
-            config["validation_split"] = val_matches is not None
-        if "use_bits_per_character" not in config:
-            config["use_bits_per_character"] = False
-
-        # Backwards compatibility
-        if "dataset_languages" in config:
-            config["languages"] = config.pop("dataset_languages")
-
-        # Handle languages being a JSON-encoded string
-        languages_value = config.get("languages")
-        if isinstance(languages_value, str):
-            try:
-                config["languages"] = json.loads(languages_value)
-            except json.JSONDecodeError:
-                # Fallback: treat as a single language code (e.g. "bg" -> ["bg"])
-                config["languages"] = [languages_value]
-
-        # Fill in missing required fields with defaults for very old result formats
-        if "task" not in config:
-            config["task"] = ""
-        if "languages" not in config:
-            config["languages"] = []
-        if "results" not in config:
-            config["results"] = {"raw": [], "total": {}}
-        if "num_model_parameters" not in config:
-            config["num_model_parameters"] = 0
-        if "max_sequence_length" not in config:
-            config["max_sequence_length"] = 0
-        if "vocabulary_size" not in config:
-            config["vocabulary_size"] = 0
-
-        # Backwards compatibility: convert old raw_results format where
-        # raw = {"test": [{"mcc": 0.5, "accuracy": 0.6}]} to flattened
-        # raw = {"test_mcc": 0.5, "test_accuracy": 0.6}
-        _convert_old_raw_results_format(config)
-
-        return cls(**config)  # ty: ignore[invalid-argument-type]
-
-    @classmethod
-    def from_eee_dict(cls, config: dict[str, object]) -> "BenchmarkResult":
-        """Create a BenchmarkResult from an Every Eval Ever format dictionary.
-
-        Reconstructs a full `BenchmarkResult` from a dictionary conforming to the
-        Every Eval Ever (EEE) JSON schema v0.2.1.  The method is the inverse of
-        `to_eee_dict` and enables lossless round-trips via `from_dict`.
-
-        Args:
-            config:
-                A dictionary conforming to the EEE JSON schema v0.2.1, as produced
-                by `to_eee_dict`.
-
-        Returns:
-            The reconstructed benchmark result.
-        """
-        return benchmark_result_from_eee_dict(config=config)
-
-    _normalise_release_date = pydantic.field_validator("release_date", mode="before")(
-        normalise_release_date
-    )
-
-
-class HashableDict(dict[t.Any, t.Any]):
-    """A hashable dictionary."""
-
-    def __hash__(self) -> int:
-        """Return the hash of the dictionary.
-
-        Returns:
-            The hash value.
-        """
-        return hash(frozenset(self.items()))
-
-
-@dataclass
-class GenerativeModelOutput:
-    """The output of a generative model.
-
-    Attributes:
-        sequences:
-            The generated sequences.
-        predicted_labels (optional):
-            The predicted labels from the `sequences` and sometimes also `scores`. Can
-            be None if the labels have not been predicted yet. Defaults to None.
-        scores (optional):
-            The scores of the sequences. This is an array of shape (batch_size,
-            num_tokens, num_logprobs, 2), where the last dimension contains the
-            token and its logprob. Can be None if the scores are not available. Defaults
-            to None.
-        metadatas (optional):
-            All the metadata fields for the samples, including ground truth labels (if
-            applicable). Defaults to an empty list.
-        failed_instances (optional):
-            A list of dictionaries, one per failed instance, each containing
-            ``"sample_index"`` (the index of the sample in the batch) and ``"error"``
-            (a short description of why it failed). Defaults to an empty list.
-        bpc_scores (optional):
-            Bits-per-character scores for each generated sequence. Computed as
-            ``sum(log P(answer_tokens)) / len(answer_chars)``. Lower is better.
-            Only populated when ``use_bits_per_character=True``. Defaults to None.
+    Returns:
+        A comma-separated string showing up to the first ten pairs, with
+        a ``(+N more)`` suffix when truncated.
     """
-
-    sequences: c.Sequence[str]
-    predicted_labels: c.Sequence[object] | None = None
-    scores: c.Sequence[c.Sequence[c.Sequence[tuple[str, float]]]] | None = None
-    metadatas: list["HashableDict | None"] = field(default_factory=list)
-    failed_instances: list["FailedInstance"] = field(default_factory=list)
-    bpc_scores: c.Sequence[float] | None = None
-
-    def __post_init__(self) -> None:
-        """Post-initialisation."""
-        if not self.metadatas:
-            self.metadatas = [None] * len(self.sequences)
+    sorted_pairs = sorted(dataset_language_pairs)
+    preview = [f"{dataset}/{language}" for dataset, language in sorted_pairs[:10]]
+    suffix = ""
+    if len(sorted_pairs) > 10:
+        suffix = f" (+{len(sorted_pairs) - 10} more)"
+    return ", ".join(preview) + suffix
 
 
-@dataclass
-class HFModelInfo:
-    """Information about a Hugging Face model.
+def num_errored_benchmarks(output: str) -> int:
+    """Return the number of errored benchmarks parsed from euroeval output.
 
-    Attributes:
-        pipeline_tag:
-            The pipeline tag of the model.
-        tags:
-            The other tags of the model.
-        adapter_base_model_id:
-            The model ID of the base model if the model is an adapter model. Can be None
-            if the model is not an adapter model.
-        release_date (optional):
-            The date when model weights were first publicly available, formatted as
-            ISO 8601. Defaults to None when it cannot be determined.
-        siblings (optional):
-            The repo's file names, or None if not fetched (e.g. offline, local).
+    Args:
+        output:
+            The full captured combined-output of the euroeval subprocess.
+
+    Returns:
+        The integer reported by the last ``errored N benchmarks`` line,
+        or 0 if no such line is present.
     """
-
-    pipeline_tag: str
-    tags: c.Sequence[str]
-    adapter_base_model_id: str | None
-    release_date: str | None = None
-    siblings: c.Sequence[str] | None = None
+    last = 0
+    for m in ERRORED_BENCHMARKS_RE.finditer(output):
+        last = int(m.group(1))
+    return last
 
 
-@dataclass
-class ModelConfig:
-    """Configuration for a model.
+def num_skipped_benchmarks(output: str) -> int:
+    """Return the number of skipped benchmarks parsed from euroeval output.
 
-    Attributes:
+    EuroEval deliberately skips a benchmark when, for instance, the
+    model's generative type does not match what the dataset allows. These
+    are not failures.
+
+    Args:
+        output:
+            The full captured combined-output of the euroeval subprocess.
+
+    Returns:
+        The integer reported by the last ``skipped N benchmarks`` line,
+        or 0 if no such line is present.
+    """
+    last = 0
+    for m in SKIPPED_BENCHMARKS_RE.finditer(output):
+        last = int(m.group(1))
+    return last
+
+
+def read_jsonl_lines(path: Path) -> list[str]:
+    """Return the non-empty lines of a JSONL file, or an empty list if absent.
+
+    Args:
+        path:
+            Path to the JSONL file.
+
+    Returns:
+        The stripped lines that contain at least one non-whitespace
+        character.
+    """
+    if not path.is_file():
+        return []
+    return [
+        line.rstrip("\n")
+        for line in path.read_text(encoding="utf-8").split("\n")
+        if line.strip()
+    ]
+
+
+def result_lines_for_model(lines: list[str], model_id: str) -> list[str]:
+    """Return the subset of ``lines`` whose parsed ``model`` matches ``model_id``.
+
+    Args:
+        lines:
+            The JSONL lines to filter.
         model_id:
-            The ID of the model.
-        revision:
-            The revision of the model.
-        param:
-            The parameter of the model, or None if the model has no parameters.
-        task:
-            The task that the model was trained on.
-        languages:
-            The languages of the model.
-        inference_backend:
-            The backend used to perform inference with the model.
-        merge:
-            Whether the model is a merged model.
-        model_type:
-            The type of the model (e.g., encoder, base decoder, instruction tuned).
-        fresh:
-            Whether the model is freshly initialised.
-        model_cache_dir:
-            The directory to cache the model in.
-        adapter_base_model_id:
-            The model ID of the base model if the model is an adapter model. Can be None
-            if the model is not an adapter model.
-        release_date (optional):
-            The model's public release date, formatted as ISO 8601. Defaults to None.
-        generation_config (optional):
-            The generation configuration for generative models, if specified in the
-            model repository. Defaults to no generation configuration.
+            The model id to match.
+
+    Returns:
+        The lines whose ``BenchmarkResult.model`` equals ``model_id``.
     """
-
-    model_id: str
-    revision: str
-    param: str | None
-    task: str
-    languages: c.Sequence[Language]
-    inference_backend: "InferenceBackend"
-    merge: bool
-    model_type: ModelType
-    fresh: bool
-    model_cache_dir: str
-    adapter_base_model_id: str | None
-    release_date: str | None = None
-    generation_config: GenerationConfig | None = None
-
-    def __hash__(self) -> int:
-        """Return a hash of the model configuration.
-
-        Returns:
-            The hash value.
-        """
-        return hash(self.model_id)
-
-
-@dataclass
-class ModelIdComponents:
-    """A model ID split into its components.
-
-    Attributes:
-        model_id:
-            The main model ID without revision or parameters.
-        revision:
-            The revision of the model, if any.
-        param:
-            The parameter of the model, if any.
-    """
-
-    model_id: str
-    revision: str
-    param: str | None
-
-
-@dataclass
-class PreparedModelInputs:
-    """The inputs to a model.
-
-    Attributes:
-        texts:
-            The texts to input to the model. Can be None if the input IDs and attention
-            mask are provided instead.
-        input_ids:
-            The input IDs of the texts. Can be None if the texts are provided instead.
-        attention_mask:
-            The attention mask of the texts. Can be None if the texts are provided
-            instead.
-    """
-
-    texts: c.Sequence[str] | None = None
-    input_ids: torch.Tensor | None = None
-    attention_mask: torch.Tensor | None = None
-
-
-@dataclass
-class PromptConfig:
-    """Configuration for task-specific prompting across languages.
-
-    Defines the prompt templates needed for evaluating a specific task in a given
-    language.
-
-    Attributes:
-        default_prompt_prefix:
-            The default prefix to use in the few-shot prompt.
-        default_prompt_template:
-            The default template for the prompt to use when benchmarking the dataset
-            using few-shot evaluation.
-        default_instruction_prompt:
-            The default prompt to use when benchmarking the dataset using
-            instruction-based evaluation.
-        default_prompt_label_mapping:
-            The default mapping from the labels to another phrase which is used as a
-            substitute for the label in few-shot evaluation. If set to "auto", the
-            mapping will be set to a 1:1 mapping between the labels and themselves.
-    """
-
-    default_prompt_prefix: str
-    default_prompt_template: str
-    default_instruction_prompt: str
-    default_prompt_label_mapping: dict[str, str] | t.Literal["auto"]
-
-
-@dataclass
-class SingleGenerativeModelOutput:
-    """A single output of a generative model.
-
-    Attributes:
-        sequence:
-            The generated sequence.
-        predicted_label (optional):
-            The predicted label from the `sequence` and sometimes also `scores`. Can be
-            None if the label has not been predicted yet. Defaults to None.
-        scores (optional):
-            The scores of the sequence. This is an array of shape (num_tokens,
-            num_logprobs, 2), where the last dimension contains the token and its
-            logprob. Can be None if the scores are not available. Defaults to None.
-        metadata (optional):
-            The metadata fields for the sample, including ground truth labels (if
-            applicable). Can be None if the metadata is not available. Defaults to None.
-        bpc_score (optional):
-            Bits-per-character score for this generated sequence. Computed as
-            ``sum(log P(answer_tokens)) / len(answer_chars)``. Lower is better.
-            Only populated when ``use_bits_per_character=True``. Defaults to None.
-    """
-
-    sequence: str
-    predicted_label: str | None = None
-    scores: c.Sequence[c.Sequence[tuple[str, float]]] | None = None
-    metadata: "HashableDict | None" = None
-    bpc_score: float | None = None
-
-
-@dataclass
-class Task:
-    """A dataset task.
-
-    Attributes:
-        name:
-            The name of the task.
-        task_group:
-            The task group of the task.
-        template_dict:
-            The template dictionary for the task, from language (or language tuples) to
-            prompt template.
-        metrics:
-            The metrics used to evaluate the task.
-        default_num_few_shot_examples:
-            The default number of examples to use when benchmarking the task using
-            few-shot evaluation. For a classification task, these will be drawn evenly
-            from each label.
-        default_max_generated_tokens:
-            The default maximum number of tokens to generate when benchmarking the task
-            using few-shot evaluation.
-        default_labels (optional):
-            The default labels for datasets using this task. Can be None if the labels
-            should be set manually in the dataset configs. Defaults to an empty tuple.
-        requires_zero_shot (optional):
-            Whether to only allow zero-shot evaluation for this task. If True, the
-            task will not be evaluated using few-shot examples.
-        uses_structured_output (optional):
-            Whether the task uses structured output. If True, the task will return
-            structured output (e.g., BIO tags for NER). Defaults to False.
-        structured_output_format (optional):
-            Schema to use for structured output as a (deserializable) JSON string.
-            Only used if `uses_structured_output` is True.
-            If None output structure will be determined by a default behavior
-            based on the task.
-            Defaults to None.
-        uses_logprobs (optional):
-            Whether the task uses log probabilities. If True, the task will return
-            log probabilities for the generated tokens. Defaults to False.
-        requires_logprobs (optional):
-            Whether the task requires log probabilities. Implies `uses_logprobs`.
-        default_allowed_model_types (optional):
-            A list of model types that are allowed to be evaluated on this task.
-            Defaults to all model types being allowed.
-        default_allowed_generative_types (optional):
-            A list of generative model types that are allowed to be evaluated on this
-            task. If None, all generative model types are allowed. Only relevant if
-            `allowed_model_types` includes generative models.
-        default_allow_invalid_model_outputs (optional):
-            Whether to allow invalid model outputs. This is only relevant for generative
-            models on classification tasks, where the model may generate an output
-            which is not one of the allowed labels. If True, the model output will be
-            mapped to the closest valid label. If False, the model output will be
-            considered incorrect and the evaluation will be aborted. Defaults to True.
-    """
-
-    model_config = pydantic.ConfigDict(
-        protected_namespaces=(), arbitrary_types_allowed=True
-    )
-
-    name: str
-    task_group: TaskGroup
-    template_dict: (
-        dict[Language, PromptConfig] | dict[tuple[Language, Language], PromptConfig]
-    )
-    metrics: c.Sequence[Metric]
-    default_num_few_shot_examples: int
-    default_max_generated_tokens: int
-    default_labels: c.Sequence[str] | None = tuple()
-    requires_zero_shot: bool = False
-    uses_structured_output: bool = False
-    structured_output_format: pydantic.BaseModel | None = None
-    uses_logprobs: bool = False
-    requires_logprobs: bool = False
-    default_allowed_model_types: c.Sequence[ModelType] = field(
-        default_factory=lambda: list(ModelType)
-    )
-    default_allowed_generative_types: c.Sequence[GenerativeType] = field(
-        default_factory=lambda: [
-            GenerativeType.BASE,
-            GenerativeType.INSTRUCTION_TUNED,
-            GenerativeType.REASONING,
-        ]
-    )
-    default_allow_invalid_model_outputs: bool = True
-
-    def __hash__(self) -> int:
-        """Return a hash of the task.
-
-        Returns:
-            The hash value.
-        """
-        return hash(self.name)
-
-    def __post_init__(self) -> None:
-        """Post-initialisation checks."""
-        self.uses_logprobs = self.uses_logprobs or self.requires_logprobs
-        if not self.uses_structured_output and self.structured_output_format:
-            log_once(
-                "`structured_output_format` is specified however "
-                "`uses_structured_output=False` "
-                "- thus this specified structure will not be used.",
-                level=logging.WARNING,
-            )
-
-
-class DatasetConfig:
-    """Configuration for a dataset."""
-
-    def __init__(
-        self,
-        task: Task,
-        languages: c.Sequence[Language],
-        name: str | None = None,
-        pretty_name: str | None = None,
-        source: str | dict[str, str] | None = None,
-        revision: str = "main",
-        prompt_prefix: str | None = None,
-        prompt_template: str | None = None,
-        instruction_prompt: str | None = None,
-        num_few_shot_examples: int | None = None,
-        max_generated_tokens: int | None = None,
-        labels: c.Sequence[str] | None = None,
-        prompt_label_mapping: dict[str, str] | t.Literal["auto"] | None = None,
-        allowed_model_types: c.Sequence[ModelType] | None = None,
-        allowed_generative_types: c.Sequence[GenerativeType] | None = None,
-        allow_invalid_model_outputs: bool | None = None,
-        train_split: str | None = "train",
-        val_split: str | None = "val",
-        test_split: str = "test",
-        bootstrap_samples: bool = True,
-        unofficial: bool = False,
-        input_column: str = "text",
-        target_column: str | None = None,
-        choices_column: str | list[str] | None = None,
-        preprocessing_func: c.Callable[[DatasetDict], DatasetDict] | None = None,
-    ) -> None:
-        """Initialise a DatasetConfig object.
-
-        Args:
-            task:
-                The task of the dataset.
-            languages:
-                The ISO 639-1 language codes of the entries in the dataset.
-            name (optional):
-                The name of the dataset. Must be lower case with no spaces. Can be None
-                if and only if the dataset config resides directly in the Hugging Face
-                dataset repo. Defaults to None.
-            pretty_name (optional):
-                A longer prettier name for the dataset, which allows cases and spaces.
-                Used for logging. Can be None if and only if the dataset config resides
-                directly in the Hugging Face dataset repo. Defaults to None.
-            source (optional):
-                The source of the dataset, which can be a Hugging Face ID or a
-                dictionary with keys "train", "val" and "test" mapping to local CSV file
-                paths. Can be None if and only if the dataset config resides directly in
-                the Hugging Face dataset repo. Defaults to None.
-            revision (optional):
-                Hugging Face dataset revision to load. Defaults to "main".
-            prompt_prefix (optional):
-                The prefix to use in the few-shot prompt. Defaults to the template for
-                the task and language.
-            prompt_template (optional):
-                The template for the prompt to use when benchmarking the dataset using
-                few-shot evaluation. Defaults to the template for the task and language.
-            instruction_prompt (optional):
-                The prompt to use when benchmarking the dataset using instruction-based
-                evaluation. Defaults to the template for the task and language.
-            num_few_shot_examples (optional):
-                The number of examples to use when benchmarking the dataset using
-                few-shot evaluation. For a classification task, these will be drawn
-                evenly from each label. Defaults to the template for the task and
-                language.
-            max_generated_tokens (optional):
-                The maximum number of tokens to generate when benchmarking the dataset
-                using few-shot evaluation. Defaults to the template for the task and
-                language.
-            labels (optional):
-                The labels in the dataset. Defaults to the template for the task and
-                language.
-            prompt_label_mapping (optional):
-                A mapping from the labels to another phrase which is used as a
-                substitute for the label in few-shot evaluation. If "auto" then the
-                mapping will be set to a 1:1 mapping between the labels and themselves.
-                If None then the mapping will be set to the default mapping for the task
-                and language. Defaults to None.
-            allowed_model_types (optional):
-                A list of model types that are allowed to be evaluated on this dataset.
-                Defaults to the one for the task.
-            allowed_generative_types (optional):
-                A list of generative model types that are allowed to be evaluated on
-                this dataset. If None, all generative model types are allowed. Only
-                relevant if `allowed_model_types` includes generative models. Defaults
-                to the one for the task.
-            allow_invalid_model_outputs (optional):
-                Whether to allow invalid model outputs. This is only relevant for
-                generative models on classification tasks, where the model may generate
-                an output which is not one of the allowed labels. If True, the model
-                output will be mapped to the closest valid label. If False, the model
-                output will be considered incorrect and the evaluation will be aborted.
-                Defaults to the one for the task.
-            train_split (optional):
-                The name of the split to use as the training set. Can be None if there
-                is no training split in the dataset. Defaults to "train".
-            val_split (optional):
-                The name of the split to use as the validation set. Can be None if there
-                is no validation split in the dataset. Defaults to "val".
-            test_split (optional):
-                The name of the split to use as the test set. Defaults to "test".
-            bootstrap_samples (optional):
-                Whether to bootstrap the dataset samples. Defaults to True.
-            unofficial (optional):
-                Whether the dataset is unofficial. Defaults to False.
-            input_column (optional):
-                The name of the column in the dataset that contains the input texts.
-                If different from "text", this column will be renamed to "text". If
-                `choices_column` is also set, the two columns are merged into a single
-                "text" column formatted as in the official dataset creation scripts.
-                Defaults to "text".
-            target_column (optional):
-                The name of the column in the dataset that contains the labels. If None,
-                the default column name for the task group is used ("label" for most
-                tasks, "labels" for token classification, "target_text" for text-to-text
-                tasks). Defaults to None.
-            choices_column (optional):
-                The name of the column (or list of column names) in the dataset that
-                contains the answer choices. If a single column name is provided, that
-                column must hold a list of answer-choice strings. If a list of column
-                names is provided, each column holds a single answer-choice string.
-                When set, the input text and choices are merged into a single "text"
-                column. Defaults to None.
-            preprocessing_func (optional):
-                A custom preprocessing function that takes a DatasetDict and returns a
-                DatasetDict. If set together with any of the column arguments, a warning
-                is logged and `preprocessing_func` takes precedence. Defaults to None.
-        """
-        self._name = name
-        self._pretty_name = pretty_name
-        self._source = source
-        self.revision = revision
-        self.task = task
-        self.languages = list(languages)
-
-        template = self.task.template_dict.get(self.main_language)
-        self.prompt_prefix = (
-            prompt_prefix
-            if prompt_prefix is not None
-            else template.default_prompt_prefix
-            if template is not None
-            else ""
-        )
-        self.prompt_template = (
-            prompt_template
-            if prompt_template is not None
-            else template.default_prompt_template
-            if template is not None
-            else ""
-        )
-        self.instruction_prompt = (
-            instruction_prompt
-            if instruction_prompt is not None
-            else template.default_instruction_prompt
-            if template is not None
-            else ""
-        )
-        self.num_few_shot_examples = (
-            num_few_shot_examples
-            if num_few_shot_examples is not None
-            else self.task.default_num_few_shot_examples
-        )
-        self.max_generated_tokens = (
-            max_generated_tokens
-            if max_generated_tokens is not None
-            else self.task.default_max_generated_tokens
-        )
-        self.labels = (
-            labels if labels is not None else self.task.default_labels or list()
-        )
-        if prompt_label_mapping is None:
-            prompt_label_mapping = (
-                template.default_prompt_label_mapping
-                if template is not None
-                else dict()
-            )
-        self.prompt_label_mapping = (
-            {label: label for label in self.labels}
-            if prompt_label_mapping == "auto"
-            else prompt_label_mapping
-        )
-        self.allowed_model_types = (
-            allowed_model_types
-            if allowed_model_types is not None
-            else self.task.default_allowed_model_types
-        )
-        self.allowed_generative_types = (
-            allowed_generative_types
-            if allowed_generative_types is not None
-            else self.task.default_allowed_generative_types
-        )
-        self.allow_invalid_model_outputs = (
-            allow_invalid_model_outputs
-            if allow_invalid_model_outputs is not None
-            else self.task.default_allow_invalid_model_outputs
-        )
-        self.train_split = train_split
-        self.val_split = val_split
-        self.test_split = test_split
-        self.bootstrap_samples = bootstrap_samples
-        self.unofficial = unofficial
-
-        # Build or assign the preprocessing function
-        column_args_set = any(
-            (
-                input_column != "text",
-                target_column is not None,
-                choices_column is not None,
-            )
-        )
-        if preprocessing_func is not None and column_args_set:
-            log_once(
-                "Both `preprocessing_func` and column arguments (`input_column`, "
-                "`target_column`, `choices_column`) are set. `preprocessing_func` "
-                "takes precedence and the column arguments will be ignored.",
-                level=logging.WARNING,
-            )
-            self.preprocessing_func: c.Callable[[DatasetDict], DatasetDict] | None = (
-                preprocessing_func
-            )
-        elif column_args_set:
-            # Determine the language-specific choices label
-            main_lang = self.languages[0] if self.languages else None
-            lang_code = main_lang.code if main_lang is not None else "en"
-            choices_label = CHOICES_MAPPING.get(lang_code, "Choices")
-            self.preprocessing_func = build_preprocessing_func(
-                dataset_name=name or "",
-                task_group=self.task.task_group,
-                input_column=input_column,
-                target_column=target_column,
-                choices_column=choices_column,
-                choices_label=choices_label,
-            )
-        else:
-            self.preprocessing_func = preprocessing_func  # None or user-provided
-
-    def __hash__(self) -> int:
-        """Return a hash of the dataset configuration.
-
-        Returns:
-            The hash value.
-        """
-        return hash(self.name)
-
-    def __repr__(self) -> str:
-        """The representation of the dataset configuration.
-
-        Returns:
-            The string representation.
-        """
-        language_repr = (
-            self.languages
-            if len(self.languages) < 5
-            else list(self.languages[:5]) + ["..."]
-        )
-        parts = [f"task={self.task.name}", f"languages={language_repr}"]
+    out: list[str] = []
+    for line in lines:
         try:
-            parts.append(f"name={self.name}")
-        except ValueError:
-            pass
-        try:
-            parts.append(f"pretty_name={self.pretty_name}")
-        except ValueError:
-            pass
-        try:
-            parts.append(f"source={self.source}")
-        except ValueError:
-            pass
-        return f"DatasetConfig({', '.join(parts)})"
-
-    def get_labels_str(self, labels: c.Sequence[str] | None = None) -> str:
-        """Converts a set of labels to a natural string, in the specified language.
-
-        If the task is NER, we separate using 'and' and use the mapped labels instead of
-        the BIO NER labels.
-
-        Args:
-            labels (optional):
-                The labels to convert to a natural string. If None, uses all the labels
-                in the dataset. Defaults to None.
-
-        Returns:
-            The natural string representation of the labels in specified language.
-        """
-        main_language = self.main_language
-        if not isinstance(main_language, Language):
-            # Translation datasets have a (source, target) tuple; the labels, if any,
-            # belong to the target language.
-            _, main_language = main_language
-        if self.task.task_group == TaskGroup.TOKEN_CLASSIFICATION:
-            sep_word = main_language.and_separator
-        else:
-            sep_word = main_language.or_separator
-
-        if labels is None:
-            labels = list()
-            for english_label in self.labels:
-                if english_label not in self.prompt_label_mapping:
-                    continue
-                label = self.prompt_label_mapping[english_label]
-                if label not in labels:
-                    labels.append(label)
-
-        # Convert labels to single-quoted labels - and remove duplicates
-        quoted_labels = [f"'{label}'" for label in labels]
-
-        if not quoted_labels:
-            return ""
-        elif len(quoted_labels) == 1:
-            return quoted_labels[0]
-        elif len(quoted_labels) == 2:
-            return f"{quoted_labels[0]} {sep_word} {quoted_labels[1]}"
-        else:
-            return f"{', '.join(quoted_labels[:-1])} {sep_word} {quoted_labels[-1]}"
-
-    @property
-    def id2label(self) -> "HashableDict":
-        """The mapping from ID to label.
-
-        Returns:
-            A mapping from label IDs to labels.
-        """
-        return HashableDict({idx: label for idx, label in enumerate(self.labels)})
-
-    @property
-    def label2id(self) -> "HashableDict":
-        """The mapping from label to ID.
-
-        Returns:
-            A mapping from labels to label IDs.
-        """
-        return HashableDict({label: i for i, label in enumerate(self.labels)})
-
-    @property
-    def logging_string(self) -> str:
-        """The string used to describe evaluation on the dataset in logging.
-
-        Returns:
-            The logging string.
-        """
-        truncated_str = (
-            "truncated version of the "
-            if isinstance(self.source, str) and self.source.endswith("-mini")
-            else ""
-        )
-
-        logging_languages = list(deepcopy(self.languages))
-        if len(self.languages) > 1:
-            if (
-                NORWEGIAN_BOKMÅL in self.languages
-                and NORWEGIAN_NYNORSK in self.languages
-                and NORWEGIAN in self.languages
-            ):
-                logging_languages.remove(NORWEGIAN_BOKMÅL)
-                logging_languages.remove(NORWEGIAN_NYNORSK)
-            elif (
-                NORWEGIAN_BOKMÅL in self.languages
-                or NORWEGIAN_NYNORSK in self.languages
-            ) and NORWEGIAN in self.languages:
-                logging_languages.remove(NORWEGIAN)
-            if PORTUGUESE in self.languages and EUROPEAN_PORTUGUESE in self.languages:
-                logging_languages.remove(EUROPEAN_PORTUGUESE)
-
-        if len(logging_languages) > MAX_NUMBER_OF_LOGGING_LANGUAGES:
-            languages_str = ""
-        elif len(logging_languages) > 1:
-            languages_str = (
-                ", ".join([lang.name for lang in logging_languages[:-1]])
-                + f" and {logging_languages[-1].name}"
-                + " "
-            )
-        else:
-            languages_str = logging_languages[0].name + " "
-
-        task_str = self.task.name.replace("-", " ")
-        dataset_name_str = (
-            self.pretty_name or self.name.replace("-", " ").replace("_", " ").title()
-        )
-        return (
-            f"the {truncated_str}{languages_str}{task_str} dataset {dataset_name_str}"
-        )
-
-    @property
-    def main_language(self) -> "Language | tuple[Language, Language]":
-        """The main language of the dataset.
-
-        Returns:
-            The main language of the dataset. For the translation task, the
-            `TranslationDatasetConfig` subclass overrides this to return the
-            (source, target) language pair.
-
-        Raises:
-            InvalidBenchmark:
-                If the dataset has no languages.
-        """
-        match len(self.languages):
-            case 0:
-                raise InvalidBenchmark(
-                    f"Dataset {self.name!r} must have at least one language."
-                )
-            case 1:
-                return self.languages[0]
-            case _:
-                if ENGLISH in self.languages:
-                    return ENGLISH
-                elif NORWEGIAN in self.languages:
-                    return NORWEGIAN
-                elif PORTUGUESE in self.languages:
-                    return PORTUGUESE
-                else:
-                    return self.languages[0]
-
-    @property
-    def name(self) -> str:
-        """The name of the dataset.
-
-        Returns:
-            The name of the dataset.
-
-        Raises:
-            ValueError:
-                If the name of the dataset is not set.
-        """
-        if self._name is None:
-            raise ValueError("The name of the dataset is not set!")
-        return self._name
-
-    @name.setter
-    def name(self, value: str) -> None:
-        """Set the name of the dataset.
-
-        Args:
-            value:
-                The new name of the dataset.
-        """
-        self._name = value
-
-    @property
-    def num_labels(self) -> int:
-        """The number of labels in the dataset.
-
-        Returns:
-            The number of labels.
-        """
-        return len(self.labels)
-
-    @property
-    def pretty_name(self) -> str:
-        """The pretty name of the dataset.
-
-        Returns:
-            The pretty name of the dataset.
-
-        Raises:
-            ValueError:
-                If the pretty name of the dataset is not set.
-        """
-        if self._pretty_name is None:
-            raise ValueError("The pretty name of the dataset is not set!")
-        return self._pretty_name
-
-    @pretty_name.setter
-    def pretty_name(self, value: str) -> None:
-        """Set the pretty name of the dataset.
-
-        Args:
-            value:
-                The new pretty name of the dataset.
-        """
-        self._pretty_name = value
-
-    @property
-    def source(self) -> str | dict[str, str]:
-        """The source of the dataset.
-
-        Returns:
-            The source of the dataset.
-
-        Raises:
-            ValueError:
-                If the source of the dataset is not set.
-        """
-        if self._source is None:
-            raise ValueError("The source of the dataset is not set!")
-        return self._source
-
-    @source.setter
-    def source(self, value: str | dict[str, str]) -> None:
-        """Set the source of the dataset.
-
-        Args:
-            value:
-                The new source of the dataset.
-        """
-        self._source = value
+            parsed = BenchmarkResult.from_dict(config=json.loads(line))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        # Only standard accuracy runs (not BPC) count towards leaderboard completion
+        is_standard = not getattr(parsed, "use_bits_per_character", False)
+        if parsed.model == model_id and is_standard:
+            out.append(line)
+    return out
 
 
-@dataclass
-class BenchmarkConfig:
-    """General benchmarking configuration, across datasets and models.
+def summarise_evaluation_error(output: str, max_chars: int = 4000) -> str:
+    """Extract the meaningful error from a euroeval subprocess's output.
 
-    Attributes:
-        datasets:
-            The datasets to benchmark on.
-        finetuning_batch_size:
-            The batch size to use for finetuning.
-        raise_errors:
-            Whether to raise errors instead of skipping them.
-        cache_dir:
-            Directory to store cached models and datasets.
-        api_key:
-            The API key to use for a given inference API.
-        api_base:
-            The base URL for a given inference API. Only relevant if `model` refers to a
-            model on an inference API.
-        api_version:
-            The version of the API to use. Only relevant if `model` refers to a model on
-            an inference API.
-        progress_bar:
-            Whether to show a progress bar.
-        save_results:
-            Whether to save the benchmark results to 'euroeval_benchmark_results.json'.
-        device:
-            The device to use for benchmarking.
-        trust_remote_code:
-            Whether to trust remote code when loading models from the Hugging Face Hub.
-        clear_model_cache:
-            Whether to clear the model cache after benchmarking each model.
-        evaluate_test_split:
-            Whether to evaluate on the test split.
-        few_shot:
-            The shot policy used during planning. ``ShotMode.AUTO`` selects modes
-            automatically; booleans remain accepted for backwards compatibility. This
-            field is never persisted in a benchmark result.
-        num_iterations:
-            The number of iterations each model should be evaluated for.
-        gpu_memory_utilization:
-            The GPU memory utilization to use for vLLM. A larger value will result in
-            faster evaluation, but at the risk of running out of GPU memory. Only reduce
-            this if you are running out of GPU memory. Only relevant if the model is
-            generative.
-        attention_backend:
-            The attention backend to use for vLLM. Only relevant if the model is
-            generative. If None then vLLM will automatically select the best attention
-            backend.
-        requires_safetensors:
-            Whether to only allow models that use the safetensors format.
-        generative_type:
-            The type of generative model to benchmark. Only relevant if the model is
-            generative.
-        download_only:
-            Whether to only download the models, metrics and datasets without
-            evaluating.
-        force:
-            Whether to force the benchmark to run even if the results are already
-            cached.
-        verbose:
-            Whether to print verbose output.
-        debug:
-            Whether to run the benchmark in debug mode.
-        run_with_cli:
-            Whether the benchmark is being run with the CLI.
-        max_context_length:
-            Override for the maximum context length of the model. If None, the value
-            will be inferred automatically from the model.
-        vocabulary_size:
-            Override for the vocabulary size of the model. If None, the value will be
-            inferred automatically from the model.
-        num_parameters:
-            Override for the number of parameters in the model. If None, the value will
-            be inferred automatically from the model.
-        use_bits_per_character:
-            Whether to compute bits-per-character (BPC) on the ground-truth answer.
-            For multiple-choice tasks, treats benchmark as text-to-text with bare
-            question → full answer text. Only supported for base decoder models.
+    The queue runs euroeval with ``FULL_LOG=1``, so the raw output is dominated
+    by serialised result records, training-progress dicts and giant parameter
+    lists. A blind tail of that output almost never shows the real error (and is
+    frequently identical across unrelated models), so this scans the whole
+    output for the informative error text: a Python traceback, a model-load or
+    gating error, and the ``errored N benchmarks`` summary line.
+
+    Args:
+        output:
+            The full captured combined-output of the euroeval subprocess.
+        max_chars (optional):
+            The maximum length of the returned summary. Defaults to 4000.
+
+    Returns:
+        A compact human-readable error summary, or ``"(no output captured)"``
+        when nothing usable is found.
     """
+    text = _ANSI_ESCAPE_RE.sub("", output)
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        if not raw_line.strip() or _is_noise_line(raw_line):
+            continue
+        line = raw_line.rstrip()
+        if len(line) > _MAX_LINE_CHARS:
+            line = line[:_MAX_LINE_CHARS] + " …(truncated)"
+        lines.append(line)
 
-    datasets: c.Sequence[DatasetConfig]
-    languages: c.Sequence[Language]
-    finetuning_batch_size: int
-    raise_errors: bool
-    cache_dir: str
-    api_key: str | None
-    api_base: str | None
-    api_version: str | None
-    progress_bar: bool
-    save_results: bool
-    device: torch.device
-    trust_remote_code: bool
-    clear_model_cache: bool
-    evaluate_test_split: bool
-    few_shot: ShotMode | bool
-    num_iterations: int
-    gpu_memory_utilization: float
-    attention_backend: (
-        t.Literal[
-            *ATTENTION_BACKENDS  # ty: ignore[invalid-type-form]
-        ]
-        | None
-    )
-    requires_safetensors: bool
-    generative_type: GenerativeType | None
-    download_only: bool
-    force: bool
-    verbose: bool
-    debug: bool
-    run_with_cli: bool
-    max_context_length: int | None
-    vocabulary_size: int | None
-    num_parameters: int | None
-    use_bits_per_character: bool = False
-    served_model: str | None = None
+    if not lines:
+        return "(no output captured)"
 
-    def __post_init__(self) -> None:
-        """Post-initialisation checks."""
-        # Set dummy API key if it has not been set and we're benchmarking a model on an
-        # inference API
-        if self.api_key is None and self.api_base is not None:
-            self.api_key = "dummy"
-
-    @property
-    def tasks(self) -> c.Sequence[Task]:
-        """The tasks in the benchmark configuration.
-
-        Returns:
-            The tasks included in this configuration.
-        """
-        return list({dataset_config.task for dataset_config in self.datasets})
-
-
-class BenchmarkConfigParams(pydantic.BaseModel):
-    """The parameters for the benchmark configuration."""
-
-    model_config = pydantic.ConfigDict(
-        protected_namespaces=(), arbitrary_types_allowed=True
+    worker_block = _worker_errors(lines=lines)
+    traceback = _last_traceback(lines=lines)
+    parts = _build_error_summary_parts(
+        lines=lines, worker_block=worker_block, traceback=traceback
     )
 
-    task: str | Task | c.Sequence[str | Task] | None
-    dataset: str | DatasetConfig | c.Sequence[str | DatasetConfig] | None
-    progress_bar: bool
-    save_results: bool
-    language: str | c.Sequence[str]
-    device: Device | None
-    finetuning_batch_size: int
-    raise_errors: bool
-    cache_dir: str
-    api_key: str | None
-    api_base: str | None
-    api_version: str | None
-    trust_remote_code: bool
-    clear_model_cache: bool
-    evaluate_test_split: bool
-    few_shot: ShotMode | bool | None
-    num_iterations: int
-    requires_safetensors: bool
-    download_only: bool
-    gpu_memory_utilization: float
-    attention_backend: (
-        t.Literal[
-            *ATTENTION_BACKENDS  # ty: ignore[invalid-type-form]
-        ]
-        | None
-    )
-    generative_type: GenerativeType | None
-    custom_datasets_file: Path
-    force: bool
-    verbose: bool
-    debug: bool
-    run_with_cli: bool
-    max_context_length: int | None
-    vocabulary_size: int | None
-    num_parameters: int | None
-    use_bits_per_character: bool = False
-    served_model: str | None = None
+    # Fall back to tail when no marker found
+    if not parts:
+        parts = [line.strip() for line in lines[-20:]]
+
+    # De-duplicate while preserving order (a traceback may repeat the summary).
+    summary = "\n".join(dict.fromkeys(part for part in parts if part)).strip()
+    if len(summary) > max_chars:
+        summary = summary[-max_chars:].strip()
+    return summary or "(no output captured)"
 
 
-class TranslationDatasetConfig(DatasetConfig):
-    """Configuration for a translation dataset.
+def _build_error_summary_parts(
+    lines: list[str], worker_block: str | None, traceback: str | None
+) -> list[str]:
+    """Build error summary parts from worker errors and traceback.
 
-    Translation datasets evaluate translation from a source language into a target
-    language. Those two languages are kept on this dedicated subclass rather than on
-    `DatasetConfig`, since they are only meaningful for the translation task and would
-    otherwise bloat every dataset config. The `languages` attribute continues to hold
-    the single leaderboard language (the non-English side), so translation datasets are
-    never selected for or filed under the English leaderboard.
+    Args:
+        lines:
+            Cleaned output lines.
+        worker_block:
+            Worker error block from _worker_errors.
+        traceback:
+            Traceback from _last_traceback.
+
+    Returns:
+        List of summary parts.
     """
+    parts: list[str] = []
+    # Prefer worker block unless a genuine traceback was captured
+    if worker_block and (traceback is None or _WORKERPROC_FAILED_RE.search(traceback)):
+        parts.append(worker_block)
+    elif traceback:
+        parts.append(traceback)
 
-    def __init__(
-        self,
-        task: Task,
-        languages: c.Sequence[Language],
-        source_language: Language,
-        target_language: Language,
-        **kwargs,
-    ) -> None:
-        """Initialise a TranslationDatasetConfig object.
+    # Add load error (skip vLLM excuse line if traceback present)
+    for line in reversed(lines):
+        if _LOAD_ERROR_RE.search(line):
+            if traceback and "did not mention exactly what" in line:
+                break
+            parts.append(line.strip())
+            break
 
-        Args:
-            task:
-                The task of the dataset.
-            languages:
-                The ISO 639-1 language codes of the entries in the dataset. This is the
-                leaderboard language (the non-English side of the translation), not the
-                source/target pair.
-            source_language:
-                The language to translate from.
-            target_language:
-                The language to translate into.
-            **kwargs:
-                Additional keyword arguments passed on to `DatasetConfig`.
-        """
-        # Set before calling super().__init__, as the base initialiser reads
-        # `main_language` (overridden below) to select the prompt template.
-        self.source_language = source_language
-        self.target_language = target_language
-        super().__init__(task=task, languages=languages, **kwargs)
+    # Add summary line if found
+    for line in reversed(lines):
+        if _SUMMARY_LINE_RE.search(line):
+            parts.append(line.strip())
+            break
 
-    @property
-    def main_language(self) -> tuple[Language, Language]:
-        """The source and target languages of the translation dataset.
+    return parts
 
-        Returns:
-            The (source, target) language pair.
-        """
-        return (self.source_language, self.target_language)
+
+def _is_noise_line(line: str) -> bool:
+    """Return True if a line is verbose ``FULL_LOG`` output rather than an error.
+
+    Args:
+        line:
+            A single (already ANSI-stripped) line of euroeval output.
+
+    Returns:
+        True if the line is a serialised result record or a training-progress
+        dict that should be dropped from an error summary.
+    """
+    stripped = line.strip()
+    if any(sub in stripped for sub in _NOISE_SUBSTRINGS):
+        return True
+    return bool(_TRAINING_PROGRESS_RE.match(stripped))
+
+
+def _last_traceback(lines: list[str]) -> str | None:
+    """Return the last Python traceback in ``lines``, or None if there is none.
+
+    Args:
+        lines:
+            The cleaned, noise-filtered output lines.
+
+    Returns:
+        The traceback text, from its ``Traceback (most recent call last):``
+        header through the terminating exception line, or None.
+    """
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith(_TRACEBACK_START):
+            start = i
+    if start is None:
+        return None
+    # Extend to the exception line that closes the traceback (the first line at
+    # the end that is not an indented frame), keeping the block compact.
+    end = start
+    for i in range(start + 1, len(lines)):
+        end = i
+        if _EXCEPTION_LINE_RE.match(lines[i].strip()):
+            break
+    return "\n".join(lines[start : end + 1]).strip()
+
+
+def _worker_errors(lines: list[str]) -> str | None:
+    """Return the first worker-prefixed error block in ``lines``, or None.
+
+    vLLM's ``WorkerProc`` logs the real cause of an initialisation failure from
+    the worker subprocess, prefixing every line with ``(Worker_TP* pid=*)``.
+    The main process only re-raises a generic ``WorkerProc initialization
+    failed`` exception, so without this helper the actual error -- buried in
+    worker-prefixed ``ERROR`` lines -- is never surfaced.
+
+    Args:
+        lines:
+            The cleaned, noise-filtered output lines.
+
+    Returns:
+        The first worker ``ERROR`` line together with the consecutive
+        worker-prefixed lines that follow it (typically the worker's
+        traceback), joined with newlines, or None when no worker error is
+        present.
+    """
+    start = None
+    for i, line in enumerate(lines):
+        if _WORKER_ERROR_RE.match(line.strip()):
+            start = i
+            break
+    if start is None:
+        return None
+    end = start
+    for i in range(start + 1, len(lines)):
+        if not _WORKER_PREFIX_RE.match(lines[i].strip()):
+            break
+        end = i
+    return "\n".join(lines[start : end + 1]).strip()
